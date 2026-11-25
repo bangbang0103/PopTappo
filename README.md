@@ -1,4 +1,4 @@
-# PopTappo
+# <img src="assets/icon.png" alt="PopTappo" width="36" align="absmiddle" /> PopTappo
 
 用于 Windows 10 / 11 x64 的鸣潮桌宠（Wuwa Tappo）轻量托盘助手。
 
