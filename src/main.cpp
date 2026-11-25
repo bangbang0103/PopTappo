@@ -1,5 +1,7 @@
 #include "engine.h"
 #include "resource.h"
+#include "updater.h"
+#include "version.h"
 
 #include <hidusage.h>
 #include <shellapi.h>
@@ -7,6 +9,7 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +22,7 @@ namespace {
 constexpr wchar_t AppName[] = L"PopTappo";
 constexpr wchar_t WindowClass[] = L"PopTappo.Tray";
 constexpr UINT TrayEvent = WM_APP + 1;
+constexpr UINT UpdateChecked = WM_APP + 3;
 constexpr UINT_PTR TapTimer = 1;
 constexpr UINT_PTR MenuPaintTimer = 2;
 constexpr UINT_PTR ChestTimer = 3;
@@ -26,9 +30,9 @@ constexpr UINT ChestStatusRow = 1;
 constexpr UINT SpeedMenuRow = 7;
 
 enum Command : UINT {
-    ToggleTap = 100, ToggleChests, ToggleAwake, PauseAll, Refresh, Quit,
+    ToggleTap = 100, ToggleChests, ToggleAwake, PauseAll, Refresh, Quit, CheckUpdate,
     Speed10 = 120, Speed25, Speed100, CustomSpeed, Key24 = 130, Key23, Key22, Key21,
-    SentStatus = 200, ChestStatus, TotalStatus
+    SentStatus = 200, ChestStatus, TotalStatus, VersionStatus
 };
 
 constexpr UINT PresetRates[] = {10, 25, 100};
@@ -133,6 +137,7 @@ bool UpdateMenuRadio(HMENU menu, UINT first, UINT last, UINT selected) {
 
 class App {
 public:
+    ~App();
     int Run(HINSTANCE instance);
 
 private:
@@ -152,6 +157,9 @@ private:
     void ApplyInlineCommand(UINT command);
     void RequestMenuSnapshot();
     void OnCommand(UINT command);
+    void StartUpdateCheck();
+    void OnUpdateChecked();
+    std::wstring CheckUpdateLabel() const;
     void QueueMenuUpdate();
     void UpdateMenuStatus();
     void SyncChestTimer();
@@ -177,6 +185,9 @@ private:
     bool sessionDisconnected_{};
     bool displayOff_{};
     bool editingRate_{};
+    bool showingUpdateDialog_{};
+    bool checkingUpdate_{};
+    std::atomic<bool> closing_{};
     bool tap_{};
     bool open_{};
     bool keepAwake_{};
@@ -193,6 +204,10 @@ private:
     std::optional<unsigned> menuTotal_;
     bool menuSamplePending_{};
     bool menuUpdatePending_{};
+    std::wstring latestVersion_;
+    std::mutex updateMutex_;
+    std::optional<updater::Result> updateResult_;
+    std::thread updateThread_;
     NOTIFYICONDATAW icon_{};
     std::unique_ptr<Engine> engine_;
     Snapshot status_;
@@ -200,8 +215,15 @@ private:
 
 thread_local App* App::activeMenuOwner_{};
 
+App::~App() {
+    closing_.store(true);
+    if (updateThread_.joinable()) {
+        updateThread_.join();
+    }
+}
+
 DesktopAccess App::Access() const {
-    if (suspended_ || sessionDisconnected_ || editingRate_) {
+    if (suspended_ || sessionDisconnected_ || editingRate_ || showingUpdateDialog_) {
         return DesktopAccess::Paused;
     }
     if (sessionLocked_) {
@@ -510,6 +532,11 @@ void App::ShowMenu(POINT point) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, Refresh, L"刷新桌宠状态");
     AppendMenuW(menu, MF_STRING | (tap_ || open_ ? 0 : MF_GRAYED), PauseAll, L"暂停全部");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, VersionStatus,
+                (std::wstring(L"版本 · v") + POPTAPPO_VERSION_WSTR).c_str());
+    AppendMenuW(menu, MF_STRING | (checkingUpdate_ ? MF_GRAYED : 0), CheckUpdate,
+                CheckUpdateLabel().c_str());
     AppendMenuW(menu, MF_STRING, Quit, L"退出");
 
     menu_ = menu;
@@ -583,8 +610,97 @@ void App::OnCommand(UINT command) {
             }
             break;
         }
+        case CheckUpdate: StartUpdateCheck(); break;
         case Quit: DestroyWindow(window_); break;
         }
+    }
+}
+
+std::wstring App::CheckUpdateLabel() const {
+    if (checkingUpdate_) {
+        return L"检查更新中…";
+    }
+    if (!latestVersion_.empty()) {
+        return L"检查更新（发现 " + latestVersion_ + L"）";
+    }
+    return L"检查更新";
+}
+
+void App::StartUpdateCheck() {
+    if (checkingUpdate_ || closing_.load()) {
+        return;
+    }
+    if (updateThread_.joinable()) {
+        updateThread_.join();
+    }
+    checkingUpdate_ = true;
+    UpdateMenuStatus();
+    const HWND targetWindow = window_;
+    updateThread_ = std::thread([this, targetWindow] {
+        auto result = updater::CheckLatestRelease();
+        {
+            std::lock_guard lock(updateMutex_);
+            updateResult_ = std::move(result);
+        }
+        if (!closing_.load()) {
+            PostMessageW(targetWindow, UpdateChecked, 0, 0);
+        }
+    });
+}
+
+void App::OnUpdateChecked() {
+    if (updateThread_.joinable()) {
+        updateThread_.join();
+    }
+    checkingUpdate_ = false;
+    std::optional<updater::Result> result;
+    {
+        std::lock_guard lock(updateMutex_);
+        result = std::exchange(updateResult_, std::nullopt);
+    }
+    if (!result || closing_.load()) {
+        return;
+    }
+    if (result->state == updater::State::UpdateAvailable) {
+        latestVersion_ = result->latestVersion;
+    } else if (result->state == updater::State::UpToDate) {
+        latestVersion_.clear();
+    }
+    UpdateMenuStatus();
+    if (menu_) {
+        EndMenu();
+    }
+    showingUpdateDialog_ = true;
+    SyncWork();
+    const std::wstring current = std::wstring(L"v") + POPTAPPO_VERSION_WSTR;
+    switch (result->state) {
+    case updater::State::UpdateAvailable: {
+        const auto text = L"发现新版本 " + result->latestVersion + L"（当前版本 " + current +
+            L"）。\n\n是否前往 GitHub Release 页面下载？";
+        if (MessageBoxW(nullptr, text.c_str(), AppName, MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES) {
+            ShellExecuteW(nullptr, L"open", result->releaseUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        break;
+    }
+    case updater::State::UpToDate: {
+        const auto text = L"当前已是最新版本（" + current + L"）。";
+        MessageBoxW(nullptr, text.c_str(), AppName, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        break;
+    }
+    case updater::State::NoRelease: {
+        const auto text = L"GitHub 仓库暂无已发布的 Release。\n当前版本：" + current;
+        MessageBoxW(nullptr, text.c_str(), AppName, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        break;
+    }
+    case updater::State::Error: {
+        const auto text = L"检查更新失败：" + result->message;
+        MessageBoxW(nullptr, text.c_str(), AppName, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        break;
+    }
+    }
+    showingUpdateDialog_ = false;
+    if (IsWindow(window_)) {
+        SyncWork();
     }
 }
 
@@ -665,6 +781,12 @@ void App::UpdateMenuStatus() {
         EnableMenuItem(menu_, PauseAll, MF_BYCOMMAND | (canPause ? MF_ENABLED : MF_GRAYED));
         changed = true;
     }
+    changed |= UpdateMenuText(menu_, CheckUpdate, CheckUpdateLabel());
+    const bool canCheckUpdate = !checkingUpdate_;
+    if (((GetMenuState(menu_, CheckUpdate, MF_BYCOMMAND) & MF_GRAYED) == 0) != canCheckUpdate) {
+        EnableMenuItem(menu_, CheckUpdate, MF_BYCOMMAND | (canCheckUpdate ? MF_ENABLED : MF_GRAYED));
+        changed = true;
+    }
     if (changed) {
         DrawMenuBar(window_);
     }
@@ -720,6 +842,9 @@ LRESULT App::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             UpdateTooltip();
         }
+        return 0;
+    case UpdateChecked:
+        OnUpdateChecked();
         return 0;
     case WM_INPUT:
         if (rawKeyboard_) {
@@ -781,6 +906,7 @@ LRESULT App::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return TRUE;
     case WM_DESTROY:
+        closing_.store(true);
         KillTimer(window_, TapTimer);
         KillTimer(window_, MenuPaintTimer);
         KillTimer(window_, ChestTimer);

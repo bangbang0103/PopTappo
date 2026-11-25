@@ -1,13 +1,14 @@
 #pragma code_page(65001)
 #include <windows.h>
 #include "resource.h"
+#include "version.h"
 
 1 RT_MANIFEST "app.manifest"
 
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION POPTAPPO_VERSION_MAJOR,POPTAPPO_VERSION_MINOR,POPTAPPO_VERSION_PATCH,0
+PRODUCTVERSION POPTAPPO_VERSION_MAJOR,POPTAPPO_VERSION_MINOR,POPTAPPO_VERSION_PATCH,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -16,9 +17,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "FileDescription", "PopTappo"
+            VALUE "FileVersion", POPTAPPO_VERSION_STR
             VALUE "InternalName", "PopTappo"
             VALUE "OriginalFilename", "PopTappo.exe"
             VALUE "ProductName", "PopTappo"
+            VALUE "ProductVersion", POPTAPPO_VERSION_STR
         END
     END
     BLOCK "VarFileInfo"
