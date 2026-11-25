@@ -12,6 +12,8 @@
 
 namespace tappo {
 
+inline constexpr ULONG_PTR TapInputMarker = 0x504F5054;
+
 struct Window {
     HWND visual{};
     HWND webView{};
@@ -50,15 +52,16 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     // Construct and use on a worker thread without windows.
-    Reading Read(const Window& target, bool requireVisible = true);
+    Reading Read(const Window& target, bool requireVisible = true, bool readTotal = true);
     HRESULT Open(const Chest& chest);
 
 private:
     HRESULT initialized_;
     Microsoft::WRL::ComPtr<IUIAutomation> automation_;
     Microsoft::WRL::ComPtr<IUIAutomationCacheRequest> cache_;
+    Microsoft::WRL::ComPtr<IUIAutomationCacheRequest> totalCache_;
 
-    Reading ReadWindow(HWND window, bool requireVisible);
+    Reading ReadWindow(HWND window, bool requireVisible, bool readTotal);
 };
 
 }  // namespace tappo

@@ -1,15 +1,18 @@
 #include "engine.h"
 #include "resource.h"
 
+#include <hidusage.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <wtsapi32.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -17,6 +20,10 @@ constexpr wchar_t AppName[] = L"PopTappo";
 constexpr wchar_t WindowClass[] = L"PopTappo.Tray";
 constexpr UINT TrayEvent = WM_APP + 1;
 constexpr UINT_PTR TapTimer = 1;
+constexpr UINT_PTR MenuPaintTimer = 2;
+constexpr UINT_PTR ChestTimer = 3;
+constexpr UINT ChestStatusRow = 1;
+constexpr UINT SpeedMenuRow = 7;
 
 enum Command : UINT {
     ToggleTap = 100, ToggleChests, ToggleAwake, PauseAll, Refresh, Quit,
@@ -59,26 +66,69 @@ INT_PTR CALLBACK RateDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
     return FALSE;
 }
 
-bool UpdateMenuText(HMENU menu, UINT id, std::wstring value) {
+bool UpdateMenuText(HMENU menu, UINT itemId, std::wstring value, bool byPosition = false) {
     wchar_t text[256]{};
-    GetMenuStringW(menu, id, text, ARRAYSIZE(text), MF_BYCOMMAND);
+    GetMenuStringW(menu, itemId, text, ARRAYSIZE(text), byPosition ? MF_BYPOSITION : MF_BYCOMMAND);
     if (value == text) {
         return false;
     }
     MENUITEMINFOW item{sizeof(item)};
     item.fMask = MIIM_STRING;
     item.dwTypeData = value.data();
-    return SetMenuItemInfoW(menu, id, FALSE, &item);
+    return SetMenuItemInfoW(menu, itemId, byPosition, &item);
 }
 
-BOOL CALLBACK RepaintPopup(HWND popup, LPARAM menu) {
+struct MenuRepaint {
+    HMENU menu;
+    bool chestOnly;
+};
+
+BOOL CALLBACK RepaintPopup(HWND popup, LPARAM parameter) {
+    const auto& repaint = *reinterpret_cast<const MenuRepaint*>(parameter);
     MENUBARINFO info{sizeof(info)};
-    if (!IsWindowVisible(popup) || !GetMenuBarInfo(popup, OBJID_CLIENT, 0, &info) ||
-        info.hMenu != reinterpret_cast<HMENU>(menu)) {
+    if (!IsWindowVisible(popup) || !GetMenuBarInfo(popup, OBJID_CLIENT, 0, &info) || info.hMenu != repaint.menu) {
         return TRUE;
     }
-    RedrawWindow(popup, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    RECT row{};
+    if (repaint.chestOnly && GetMenuItemRect(popup, repaint.menu, ChestStatusRow, &row)) {
+        MapWindowPoints(nullptr, popup, reinterpret_cast<POINT*>(&row), 2);
+        RedrawWindow(popup, &row, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+    } else {
+        RedrawWindow(popup, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    }
     return FALSE;
+}
+
+void SyncRawInput(HWND window, USHORT usage, bool needed, bool& registered) {
+    if (needed == registered) {
+        return;
+    }
+    const RAWINPUTDEVICE device{HID_USAGE_PAGE_GENERIC, usage,
+        DWORD(needed ? RIDEV_INPUTSINK : RIDEV_REMOVE), needed ? window : nullptr};
+    if (RegisterRawInputDevices(&device, 1, sizeof(device))) {
+        registered = needed;
+    }
+}
+
+bool IsInlineCommand(UINT command) {
+    return (command >= ToggleTap && command <= Refresh) ||
+        (command >= Speed5 && command <= CustomSpeed) ||
+        (command >= Key24 && command <= Key21);
+}
+
+bool UpdateMenuCheck(HMENU menu, UINT id, bool checked) {
+    if (((GetMenuState(menu, id, MF_BYCOMMAND) & MF_CHECKED) != 0) == checked) {
+        return false;
+    }
+    CheckMenuItem(menu, id, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
+    return true;
+}
+
+bool UpdateMenuRadio(HMENU menu, UINT first, UINT last, UINT selected) {
+    if (GetMenuState(menu, selected, MF_BYCOMMAND) & MF_CHECKED) {
+        return false;
+    }
+    return CheckMenuRadioItem(menu, first, last, selected, MF_BYCOMMAND);
 }
 
 class App {
@@ -87,6 +137,8 @@ public:
 
 private:
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK MenuFilter(int code, WPARAM wParam, LPARAM lParam);
+    static thread_local App* activeMenuOwner_;
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
     bool AddTray();
     void SyncWork();
@@ -95,14 +147,28 @@ private:
     void Tick();
     void OnInput(HRAWINPUT handle);
     void ShowMenu(POINT point);
+    bool HandleMenuInput(const MSG& message);
+    UINT InlineCommandAt(POINT point) const;
+    void ApplyInlineCommand(UINT command);
+    void RequestMenuSnapshot();
     void OnCommand(UINT command);
+    void QueueMenuUpdate();
     void UpdateMenuStatus();
+    void SyncChestTimer();
+    std::wstring ChestText() const;
+    bool IsOwnMenu(HMENU menu) const;
     void UpdateTooltip();
     std::wstring TapStatus() const;
     DesktopAccess Access() const;
 
     HWND window_{};
     HMENU menu_{};
+    HMENU speedMenu_{};
+    HMENU keyMenu_{};
+    HHOOK menuHook_{};
+    UINT menuSelectedCommand_{};
+    UINT menuPressedCommand_[2]{};
+    bool customSpeedRequested_{};
     UINT taskbarCreated_{};
     HPOWERNOTIFY displayNotify_{};
     bool sessionRegistered_{};
@@ -116,16 +182,23 @@ private:
     bool keepAwake_{};
     bool awakeRequested_{};
     bool powerError_{};
-    bool rawInput_{};
+    bool rawKeyboard_{};
     bool tapError_{};
     UINT rate_ = 10;
     unsigned key_{};
     ULONGLONG deferTapUntil_{};
     unsigned long long sent_{};
+    unsigned long long menuSent_{};
+    unsigned menuSession_{};
+    std::optional<unsigned> menuTotal_;
+    bool menuSamplePending_{};
+    bool menuUpdatePending_{};
     NOTIFYICONDATAW icon_{};
     std::unique_ptr<Engine> engine_;
     Snapshot status_;
 };
+
+thread_local App* App::activeMenuOwner_{};
 
 DesktopAccess App::Access() const {
     if (suspended_ || sessionDisconnected_ || editingRate_) {
@@ -208,17 +281,12 @@ bool App::AddTray() {
 void App::SyncWork() {
     KillTimer(window_, TapTimer);
     const auto access = Access();
-    const bool shouldTap = tap_ && access == DesktopAccess::Interactive && !displayOff_;
-    if (shouldTap != rawInput_) {
-        const RAWINPUTDEVICE device{0x01, 0x06, DWORD(shouldTap ? RIDEV_INPUTSINK : RIDEV_REMOVE),
-                                    shouldTap ? window_ : nullptr};
-        if (RegisterRawInputDevices(&device, 1, sizeof(device))) {
-            rawInput_ = shouldTap;
-        }
-    }
+    const bool shouldTap = tap_ && access == DesktopAccess::Interactive && !displayOff_ &&
+        (!menu_ || menuHook_);
+    SyncRawInput(window_, HID_USAGE_GENERIC_KEYBOARD, shouldTap, rawKeyboard_);
     if (shouldTap) {
         const UINT interval = (1000 + rate_ - 1) / rate_;
-        if (rawInput_ && SetTimer(window_, TapTimer, interval, nullptr)) {
+        if (rawKeyboard_ && SetTimer(window_, TapTimer, interval, nullptr)) {
             deferTapUntil_ = GetTickCount64() + 300;
         } else {
             tapError_ = true;
@@ -233,7 +301,7 @@ void App::SyncWork() {
 
 void App::SyncEngine() {
     if (engine_) {
-        engine_->Update(tap_ || open_, open_, Access(), menu_ != nullptr);
+        engine_->Update(tap_ || open_, open_, Access(), menu_ ? menuSession_ : 0);
     }
 }
 
@@ -255,21 +323,24 @@ void App::OnInput(HRAWINPUT handle) {
     RAWINPUT input{};
     UINT size = sizeof(input);
     if (GetRawInputData(handle, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
-        input.header.dwType == RIM_TYPEKEYBOARD && input.header.hDevice) {
+        input.header.dwType == RIM_TYPEKEYBOARD && input.header.hDevice &&
+        input.data.keyboard.ExtraInformation != tappo::TapInputMarker) {
         deferTapUntil_ = GetTickCount64() + 250;
     }
 }
 
 void App::Tick() {
-    if (!tap_ || menu_ || Access() != DesktopAccess::Interactive || displayOff_ || !status_.petReady ||
+    if (!tap_ || (menu_ && !menuHook_) || Access() != DesktopAccess::Interactive || displayOff_ || !status_.petReady ||
         !tappo::IsSameWindow(status_.target)) {
         return;
     }
     const auto now = GetTickCount64();
     GUITHREADINFO foreground{sizeof(foreground)};
     constexpr DWORD BusyUI = GUI_INMENUMODE | GUI_SYSTEMMENUMODE | GUI_POPUPMENUMODE | GUI_INMOVESIZE;
+    const bool otherMenu = GetGUIThreadInfo(0, &foreground) && (foreground.flags & BusyUI) &&
+        (!menuHook_ || foreground.hwndMenuOwner != window_);
     if (tappo::IsGestureActive() || (GetAsyncKeyState(Keys[key_]) & 0x8000) ||
-        (GetGUIThreadInfo(0, &foreground) && (foreground.flags & BusyUI))) {
+        otherMenu) {
         deferTapUntil_ = now + 250;
         return;
     }
@@ -283,6 +354,99 @@ void App::Tick() {
         tapError_ = true;
         SyncWork();
     }
+}
+
+LRESULT CALLBACK App::MenuFilter(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == MSGF_MENU && activeMenuOwner_ &&
+        activeMenuOwner_->HandleMenuInput(*reinterpret_cast<const MSG*>(lParam))) {
+        return 1;
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+bool App::IsOwnMenu(HMENU menu) const {
+    return menu && (menu == menu_ || menu == speedMenu_ || menu == keyMenu_);
+}
+
+UINT App::InlineCommandAt(POINT point) const {
+    const auto popup = WindowFromPoint(point);
+    MENUBARINFO info{sizeof(info)};
+    if (!popup || !GetMenuBarInfo(popup, OBJID_CLIENT, 0, &info) || !IsOwnMenu(info.hMenu)) {
+        return 0;
+    }
+    const int index = MenuItemFromPoint(popup, info.hMenu, point);
+    if (index < 0 || (GetMenuState(info.hMenu, index, MF_BYPOSITION) & (MF_DISABLED | MF_GRAYED))) {
+        return 0;
+    }
+    const UINT command = GetMenuItemID(info.hMenu, index);
+    return IsInlineCommand(command) ? command : 0;
+}
+
+void App::ApplyInlineCommand(UINT command) {
+    if (command == Refresh) {
+        RequestMenuSnapshot();
+        return;
+    }
+    if (command == CustomSpeed) {
+        customSpeedRequested_ = EndMenu() != FALSE;
+        return;
+    }
+    OnCommand(command);
+    SyncWork();
+}
+
+void App::RequestMenuSnapshot() {
+    if (++menuSession_ == 0) {
+        ++menuSession_;
+    }
+    menuSent_ = sent_;
+    menuSamplePending_ = true;
+    SyncEngine();
+}
+
+bool App::HandleMenuInput(const MSG& message) {
+    const auto type = message.message;
+    const bool keyDown = type == WM_KEYDOWN || type == WM_SYSKEYDOWN;
+    const bool keyUp = type == WM_KEYUP || type == WM_SYSKEYUP;
+    if (keyDown || keyUp) {
+        const auto key = message.wParam;
+        if (key >= VK_F21 && key <= VK_F24 &&
+            static_cast<ULONG_PTR>(GetMessageExtraInfo()) == tappo::TapInputMarker) {
+            return true;
+        }
+        deferTapUntil_ = GetTickCount64() + 250;
+        const bool firstPress = keyDown && !(message.lParam & (LPARAM{1} << 30));
+        if (menuSelectedCommand_ && (key == VK_RETURN || key == VK_SPACE)) {
+            if (firstPress) {
+                ApplyInlineCommand(menuSelectedCommand_);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    const bool leftDown = type == WM_LBUTTONDOWN || type == WM_LBUTTONDBLCLK;
+    const bool rightDown = type == WM_RBUTTONDOWN || type == WM_RBUTTONDBLCLK;
+    const bool leftUp = type == WM_LBUTTONUP;
+    const bool rightUp = type == WM_RBUTTONUP;
+    if (leftDown || rightDown || type == WM_MBUTTONDOWN || type == WM_XBUTTONDOWN) {
+        deferTapUntil_ = GetTickCount64() + 250;
+    }
+    if (leftDown || rightDown || leftUp || rightUp) {
+        auto& pressed = menuPressedCommand_[rightDown || rightUp];
+        const auto command = InlineCommandAt(message.pt);
+        if (leftDown || rightDown) {
+            pressed = command;
+            return pressed != 0;
+        }
+        if (const auto prior = std::exchange(pressed, 0u)) {
+            if (prior == command) {
+                ApplyInlineCommand(command);
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 std::wstring App::TapStatus() const {
@@ -303,7 +467,7 @@ std::wstring App::TapStatus() const {
 
 void App::UpdateTooltip() {
     const auto label = std::wstring(AppName) + L" · " + TapStatus() +
-        (open_ ? L" · 自动开箱中" : L"");
+        (open_ ? L" · 自动开箱中" : L"") + (powerError_ ? L" · 防睡眠请求失败" : L"");
     if (icon_.hWnd && label != icon_.szTip) {
         wcsncpy_s(icon_.szTip, label.c_str(), _TRUNCATE);
         Shell_NotifyIconW(NIM_MODIFY, &icon_);
@@ -332,23 +496,16 @@ void App::ShowMenu(POINT point) {
     AppendMenuW(menu, MF_STRING | (open_ ? MF_CHECKED : 0), ToggleChests, L"自动开箱");
     AppendMenuW(menu, MF_STRING | (keepAwake_ ? MF_CHECKED : 0), ToggleAwake, L"防自动睡眠");
 
-    UINT selectedSpeed = CustomSpeed;
     for (UINT i = 0; i < ARRAYSIZE(PresetRates); ++i) {
         const auto label = std::to_wstring(PresetRates[i]) + L" 次/秒";
         AppendMenuW(speed, MF_STRING, Speed5 + i, label.c_str());
-        if (rate_ == PresetRates[i]) {
-            selectedSpeed = Speed5 + i;
-        }
     }
     AppendMenuW(speed, MF_STRING, CustomSpeed, L"自定义…");
-    CheckMenuRadioItem(speed, Speed5, CustomSpeed, selectedSpeed, MF_BYCOMMAND);
-    const auto speedLabel = L"连点速度（" + std::to_wstring(rate_) + L" 次/秒）";
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(speed), speedLabel.c_str());
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(speed), L"连点速度");
     for (UINT i = 0; i < ARRAYSIZE(Keys); ++i) {
         const auto label = L"F" + std::to_wstring(Keys[i] - VK_F1 + 1);
         AppendMenuW(keys, MF_STRING, Key24 + i, label.c_str());
     }
-    CheckMenuRadioItem(keys, Key24, Key21, Key24 + key_, MF_BYCOMMAND);
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(keys), L"模拟按键");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, Refresh, L"刷新桌宠状态");
@@ -356,18 +513,49 @@ void App::ShowMenu(POINT point) {
     AppendMenuW(menu, MF_STRING, Quit, L"退出");
 
     menu_ = menu;
-    UpdateMenuStatus();
-    SyncEngine();
-    SetForegroundWindow(window_);
-    const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                                         point.x, point.y, window_, nullptr);
+    speedMenu_ = speed;
+    keyMenu_ = keys;
+    menuTotal_.reset();
+    RequestMenuSnapshot();
+    UINT command{};
+    do {
+        menuSelectedCommand_ = menuPressedCommand_[0] = menuPressedCommand_[1] = 0;
+        activeMenuOwner_ = this;
+        // TrackPopupMenuEx owns the message loop while our menu is visible.
+        menuHook_ = SetWindowsHookExW(WH_MSGFILTER, MenuFilter, nullptr, GetCurrentThreadId());
+        if (command == CustomSpeed) {
+            SyncWork();
+        } else {
+            UpdateMenuStatus();
+        }
+        SyncChestTimer();
+        SetForegroundWindow(window_);
+        command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, window_, nullptr);
+        if (std::exchange(customSpeedRequested_, false)) {
+            command = CustomSpeed;
+        }
+        if (menuHook_) {
+            UnhookWindowsHookEx(menuHook_);
+            menuHook_ = nullptr;
+        }
+        activeMenuOwner_ = nullptr;
+        KillTimer(window_, ChestTimer);
+        PostMessageW(window_, WM_NULL, 0, 0);
+        if (command == CustomSpeed) {
+            OnCommand(command);
+        }
+    } while (command == CustomSpeed && IsWindow(window_));
     menu_ = nullptr;
-    PostMessageW(window_, WM_NULL, 0, 0);
+    speedMenu_ = keyMenu_ = nullptr;
+    KillTimer(window_, MenuPaintTimer);
+    menuUpdatePending_ = false;
     if (!command) {
         Shell_NotifyIconW(NIM_SETFOCUS, &icon_);
     }
     DestroyMenu(menu);
-    OnCommand(command);
+    if (command != CustomSpeed) {
+        OnCommand(command);
+    }
     if (IsWindow(window_)) {
         SyncWork();
     }
@@ -400,22 +588,97 @@ void App::OnCommand(UINT command) {
     }
 }
 
+void App::QueueMenuUpdate() {
+    if (menu_ && !menuUpdatePending_) {
+        menuUpdatePending_ = SetTimer(window_, MenuPaintTimer, 150, nullptr) != 0;
+        if (!menuUpdatePending_) {
+            UpdateMenuStatus();
+        }
+    }
+}
+
+std::wstring App::ChestText() const {
+    if (!status_.chestStatus.empty()) {
+        return status_.chestStatus;
+    }
+    const auto elapsed = (GetTickCount64() - status_.chestSampleTick) / 1000;
+    std::wstring text;
+    for (const auto& chest : status_.chests) {
+        if (!text.empty()) {
+            text += L" / ";
+        }
+        if (!chest.seconds) {
+            text += chest.label;
+            continue;
+        }
+        const auto seconds = *chest.seconds > elapsed ? static_cast<unsigned>(*chest.seconds - elapsed) : 0;
+        wchar_t countdown[20]{};
+        if (seconds >= 3600) {
+            swprintf_s(countdown, L"%02u:%02u:%02u", seconds / 3600, seconds / 60 % 60, seconds % 60);
+        } else {
+            swprintf_s(countdown, L"%02u:%02u", seconds / 60, seconds % 60);
+        }
+        text += countdown;
+    }
+    return text;
+}
+
+void App::SyncChestTimer() {
+    KillTimer(window_, ChestTimer);
+    if (!menu_ || editingRate_ || !status_.chestStatus.empty()) {
+        return;
+    }
+    const auto elapsed = GetTickCount64() - status_.chestSampleTick;
+    if (std::ranges::any_of(status_.chests, [elapsed](const ChestDisplay& chest) {
+            return chest.seconds && *chest.seconds > elapsed / 1000;
+        })) {
+        SetTimer(window_, ChestTimer, static_cast<UINT>(1000 - elapsed % 1000), nullptr);
+    }
+}
+
 void App::UpdateMenuStatus() {
     if (!menu_) {
         return;
     }
     bool changed = UpdateMenuText(menu_, SentStatus,
-        TapStatus() + L" · 本次发送 " + std::to_wstring(sent_) + L" 次");
-    changed |= UpdateMenuText(menu_, ChestStatus,
-        L"宝箱 · " + status_.chestStatus + L" · 已确认 " + std::to_wstring(status_.confirmed) + L" 个");
-    changed |= UpdateMenuText(menu_, TotalStatus, L"桌宠界面读数 · " +
-        (status_.total ? std::to_wstring(*status_.total) : L"—"));
-    const auto power = powerError_ ? L"防自动睡眠（请求失败）" :
-        awakeRequested_ ? L"防自动睡眠（生效中）" : L"防自动睡眠";
-    changed |= UpdateMenuText(menu_, ToggleAwake, power);
+        TapStatus() + L" · 本次发送 " + std::to_wstring(menuSent_) + L" 次");
+    const bool chestChanged = UpdateMenuText(menu_, ChestStatus,
+        L"宝箱 · " + ChestText() + L" · 已确认 " + std::to_wstring(status_.confirmed) + L" 个");
+    const auto total = menuTotal_ ? std::to_wstring(*menuTotal_) :
+        std::wstring(menuSamplePending_ ? L"读取中…" : L"—");
+    changed |= UpdateMenuText(menu_, TotalStatus, L"桌宠界面读数 · " + total);
+    changed |= UpdateMenuCheck(menu_, ToggleTap, tap_);
+    changed |= UpdateMenuCheck(menu_, ToggleChests, open_);
+    changed |= UpdateMenuCheck(menu_, ToggleAwake, keepAwake_);
+    changed |= UpdateMenuText(menu_, SpeedMenuRow,
+        L"连点速度（" + std::to_wstring(rate_) + L" 次/秒）", true);
+    UINT selectedSpeed = CustomSpeed;
+    for (UINT i = 0; i < ARRAYSIZE(PresetRates); ++i) {
+        if (rate_ == PresetRates[i]) {
+            selectedSpeed = Speed5 + i;
+        }
+    }
+    const bool speedChanged = UpdateMenuRadio(speedMenu_, Speed5, CustomSpeed, selectedSpeed);
+    const bool keyChanged = UpdateMenuRadio(keyMenu_, Key24, Key21, Key24 + key_);
+    const bool canPause = tap_ || open_;
+    if (((GetMenuState(menu_, PauseAll, MF_BYCOMMAND) & MF_GRAYED) == 0) != canPause) {
+        EnableMenuItem(menu_, PauseAll, MF_BYCOMMAND | (canPause ? MF_ENABLED : MF_GRAYED));
+        changed = true;
+    }
     if (changed) {
         DrawMenuBar(window_);
-        EnumThreadWindows(GetCurrentThreadId(), RepaintPopup, reinterpret_cast<LPARAM>(menu_));
+    }
+    if (changed || chestChanged) {
+        MenuRepaint repaint{menu_, !changed};
+        EnumThreadWindows(GetCurrentThreadId(), RepaintPopup, reinterpret_cast<LPARAM>(&repaint));
+    }
+    if (speedChanged) {
+        MenuRepaint repaint{speedMenu_, false};
+        EnumThreadWindows(GetCurrentThreadId(), RepaintPopup, reinterpret_cast<LPARAM>(&repaint));
+    }
+    if (keyChanged) {
+        MenuRepaint repaint{keyMenu_, false};
+        EnumThreadWindows(GetCurrentThreadId(), RepaintPopup, reinterpret_cast<LPARAM>(&repaint));
     }
 }
 
@@ -439,20 +702,47 @@ LRESULT App::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case Engine::Updated:
         if (engine_) {
-            status_ = engine_->Status();
+            const auto oldChest = menu_ ? ChestText() : std::wstring{};
+            auto updated = engine_->Status();
+            bool menuChanged = status_.petReady != updated.petReady || status_.confirmed != updated.confirmed;
+            if (menu_ && menuSamplePending_ && updated.menuSession == menuSession_) {
+                menuTotal_ = updated.total;
+                menuSamplePending_ = false;
+                menuChanged = true;
+            }
+            status_ = std::move(updated);
             SyncPower();
-            UpdateMenuStatus();
+            if (menu_) {
+                if (menuChanged || oldChest != ChestText()) {
+                    QueueMenuUpdate();
+                }
+                SyncChestTimer();
+            }
             UpdateTooltip();
         }
         return 0;
     case WM_INPUT:
-        if (tap_) {
+        if (rawKeyboard_) {
             OnInput(reinterpret_cast<HRAWINPUT>(lParam));
         }
         break;
+    case WM_MENUSELECT: {
+        const auto command = LOWORD(wParam);
+        menuSelectedCommand_ = IsOwnMenu(reinterpret_cast<HMENU>(lParam)) &&
+            !(HIWORD(wParam) & (MF_POPUP | MF_DISABLED | MF_GRAYED)) &&
+            IsInlineCommand(command) ? command : 0;
+        break;
+    }
     case WM_TIMER:
         if (wParam == TapTimer) {
             Tick();
+        } else if (wParam == MenuPaintTimer) {
+            KillTimer(window_, MenuPaintTimer);
+            menuUpdatePending_ = false;
+            UpdateMenuStatus();
+        } else if (wParam == ChestTimer) {
+            UpdateMenuStatus();
+            SyncChestTimer();
         }
         return 0;
     case WM_WTSSESSION_CHANGE:
@@ -492,6 +782,8 @@ LRESULT App::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return TRUE;
     case WM_DESTROY:
         KillTimer(window_, TapTimer);
+        KillTimer(window_, MenuPaintTimer);
+        KillTimer(window_, ChestTimer);
         engine_.reset();
         Shell_NotifyIconW(NIM_DELETE, &icon_);
         if (displayNotify_) {

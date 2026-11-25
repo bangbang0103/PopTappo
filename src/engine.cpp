@@ -2,40 +2,63 @@
 
 #include <algorithm>
 #include <chrono>
+#include <string_view>
 
 namespace {
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 
-std::wstring Describe(const tappo::Reading& reading) {
+std::optional<unsigned> ParseCountdown(std::wstring_view text) {
+    unsigned total{}, part{}, digits{}, separators{};
+    for (const auto ch : text) {
+        if (ch >= L'0' && ch <= L'9' && digits < 3) {
+            part = part * 10 + (ch - L'0');
+            ++digits;
+        } else if (ch == L':' && digits && separators < 2 &&
+                   (!separators || (digits == 2 && part < 60))) {
+            total = total * 60 + part;
+            part = digits = 0;
+            ++separators;
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (!separators || digits != 2 || part >= 60) {
+        return std::nullopt;
+    }
+    return total * 60 + part;
+}
+
+void DescribeChests(Snapshot& status, const tappo::Reading& reading) {
     if (!reading.ok) {
-        return L"无法读取桌宠界面";
+        status.chestStatus = L"无法读取桌宠界面";
+        return;
     }
     if (reading.popupVisible) {
-        return L"等待奖励动画";
+        status.chestStatus = L"等待奖励动画";
+        return;
     }
     if (reading.chests.empty()) {
-        return L"暂未看到宝箱";
+        status.chestStatus = L"暂未看到宝箱";
+        return;
     }
-    std::wstring text;
+    status.chestStatus.clear();
+    status.chestSampleTick = GetTickCount64();
     for (const auto& chest : reading.chests) {
-        if (!text.empty()) {
-            text += L" / ";
-        }
         switch (chest.state) {
         case tappo::ChestState::Ready:
-            text += L"就绪";
+            status.chests.push_back({L"就绪", {}});
             break;
         case tappo::ChestState::Cooling:
-            text += chest.countdown.empty() ? L"冷却中" : chest.countdown;
+            status.chests.push_back({chest.countdown.empty() ? L"冷却中" : chest.countdown,
+                                     ParseCountdown(chest.countdown)});
             break;
         case tappo::ChestState::Unavailable:
-            text += L"暂不可用";
+            status.chests.push_back({L"暂不可用", {}});
             break;
         }
     }
-    return text;
 }
 
 struct PendingChest {
@@ -57,12 +80,12 @@ Engine::~Engine() {
     thread_.join();
 }
 
-void Engine::Update(bool watch, bool open, DesktopAccess access, bool menuVisible) {
+void Engine::Update(bool watch, bool open, DesktopAccess access, unsigned menuSession) {
     {
         std::lock_guard lock(mutex_);
         watch_ = watch;
         open_ = open;
-        menuVisible_ = menuVisible;
+        menuSession_ = menuSession;
         access_ = access;
         ++revision_;
     }
@@ -92,19 +115,21 @@ void Engine::Run() {
     std::optional<tappo::Reader> reader;
     std::optional<PendingChest> pending;
     tappo::Window target;
+    std::optional<unsigned> total;
     unsigned confirmed{};
     auto interval = 2s;
     auto nextAttempt = Clock::time_point::min();
     std::wstring retryStatus;
     unsigned observedRevision{};
+    unsigned sampledMenu{};
     for (;;) {
         DesktopAccess access;
         bool open;
-        bool menuVisible;
+        unsigned menuSession;
         {
             std::unique_lock lock(mutex_);
             const auto changed = [&] { return stop_ || revision_ != observedRevision; };
-            if ((watch_ || menuVisible_) && access_ != DesktopAccess::Paused) {
+            if ((watch_ || menuSession_) && access_ != DesktopAccess::Paused) {
                 changed_.wait_for(lock, interval, changed);
             } else {
                 changed_.wait(lock, changed);
@@ -115,7 +140,7 @@ void Engine::Run() {
             observedRevision = revision_;
             access = access_;
             open = open_;
-            menuVisible = menuVisible_;
+            menuSession = menuSession_;
         }
 
         if (access == DesktopAccess::Paused ||
@@ -128,7 +153,8 @@ void Engine::Run() {
         if (discovered.visual || requireVisible || !tappo::IsSameWindow(previous, requireVisible)) {
             target = discovered;
         }
-        if (previous.visual != target.visual || previous.process != target.process) {
+        const bool targetChanged = previous.visual != target.visual || previous.process != target.process;
+        if (targetChanged) {
             pending.reset();
             nextAttempt = Clock::time_point::min();
             retryStatus.clear();
@@ -136,13 +162,23 @@ void Engine::Run() {
         if (target.visual && !reader) {
             reader.emplace();
         }
-        const auto reading = target.visual ? reader->Read(target, requireVisible) : tappo::Reading{};
+        const bool readTotal = menuSession && menuSession != sampledMenu;
+        const auto reading = target.visual ? reader->Read(target, requireVisible, readTotal) : tappo::Reading{};
+        if (readTotal) {
+            total = reading.total;
+        }
+        sampledMenu = menuSession;
         Snapshot status;
         status.target = target;
         status.petReady = reading.petFound || target.input;
-        status.total = reading.total;
-        status.chestStatus = target.visual ? Describe(reading) : L"等待 Wuwa Tappo 桌宠";
-        interval = menuVisible ? 1s : (open || !target.visual ? 2s : 5s);
+        status.total = total;
+        status.menuSession = menuSession;
+        if (target.visual) {
+            DescribeChests(status, reading);
+        } else {
+            status.chestStatus = L"等待 Wuwa Tappo 桌宠";
+        }
+        interval = open || !target.visual ? 2s : 5s;
 
         const auto ready = [](const tappo::Chest& chest) {
             return chest.state == tappo::ChestState::Ready;

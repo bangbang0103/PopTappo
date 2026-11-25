@@ -85,9 +85,9 @@ bool HasClass(std::wstring_view classes, std::wstring_view name) {
     return false;
 }
 
-using CachedString = HRESULT(STDMETHODCALLTYPE IUIAutomationElement::*)(BSTR*);
+using ElementStringGetter = HRESULT(STDMETHODCALLTYPE IUIAutomationElement::*)(BSTR*);
 
-std::wstring ReadString(IUIAutomationElement* element, CachedString getter) {
+std::wstring ReadString(IUIAutomationElement* element, ElementStringGetter getter) {
     BSTR value{};
     const auto result = (element->*getter)(&value);
     std::wstring text;
@@ -143,6 +143,7 @@ bool SendTap(WORD key) {
     INPUT input[2]{};
     input[0].type = input[1].type = INPUT_KEYBOARD;
     input[0].ki.wVk = input[1].ki.wVk = key;
+    input[0].ki.dwExtraInfo = input[1].ki.dwExtraInfo = TapInputMarker;
     input[1].ki.dwFlags = KEYEVENTF_KEYUP;
     const UINT sent = SendInput(ARRAYSIZE(input), input, sizeof(INPUT));
     if (sent == 1) {
@@ -190,16 +191,21 @@ Reader::Reader() : initialized_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {
     if (FAILED(automation_->CreateCacheRequest(cache_.GetAddressOf()))) {
         return;
     }
-    for (const auto property : {UIA_ClassNamePropertyId, UIA_NamePropertyId,
+    for (const auto property : {UIA_ClassNamePropertyId,
                                 UIA_IsEnabledPropertyId, UIA_BoundingRectanglePropertyId}) {
         if (FAILED(cache_->AddProperty(property))) {
             cache_.Reset();
             return;
         }
     }
+    if (SUCCEEDED(cache_->Clone(totalCache_.GetAddressOf())) &&
+        FAILED(totalCache_->AddProperty(UIA_NamePropertyId))) {
+        totalCache_.Reset();
+    }
 }
 
 Reader::~Reader() {
+    totalCache_.Reset();
     cache_.Reset();
     automation_.Reset();
     if (SUCCEEDED(initialized_)) {
@@ -207,14 +213,15 @@ Reader::~Reader() {
     }
 }
 
-Reading Reader::Read(const Window& target, bool requireVisible) {
+Reading Reader::Read(const Window& target, bool requireVisible, bool readTotal) {
     if (!IsSameWindow(target, requireVisible) || !cache_) {
         return {};
     }
+    readTotal = readTotal && totalCache_;
     const bool useWebView = target.webView && IsChild(target.visual, target.webView);
-    auto reading = ReadWindow(useWebView ? target.webView : target.visual, requireVisible);
+    auto reading = ReadWindow(useWebView ? target.webView : target.visual, requireVisible, readTotal);
     if (useWebView && !reading.petFound && reading.chests.empty()) {
-        auto fallback = ReadWindow(target.visual, requireVisible);
+        auto fallback = ReadWindow(target.visual, requireVisible, readTotal);
         if (fallback.petFound || !fallback.chests.empty()) {
             return fallback;
         }
@@ -222,15 +229,16 @@ Reading Reader::Read(const Window& target, bool requireVisible) {
     return reading;
 }
 
-Reading Reader::ReadWindow(HWND window, bool requireVisible) {
+Reading Reader::ReadWindow(HWND window, bool requireVisible, bool readTotal) {
     using Microsoft::WRL::ComPtr;
     ComPtr<IUIAutomationElement> root;
     ComPtr<IUIAutomationCondition> condition;
     ComPtr<IUIAutomationElementArray> elements;
     int length{};
+    auto* request = readTotal ? totalCache_.Get() : cache_.Get();
     if (FAILED(automation_->ElementFromHandle(window, &root)) ||
         FAILED(automation_->CreateTrueCondition(&condition)) ||
-        FAILED(root->FindAllBuildCache(TreeScope_Descendants, condition.Get(), cache_.Get(), &elements)) ||
+        FAILED(root->FindAllBuildCache(TreeScope_Descendants, condition.Get(), request, &elements)) ||
         FAILED(elements->get_Length(&length))) {
         return {};
     }
@@ -243,12 +251,15 @@ Reading Reader::ReadWindow(HWND window, bool requireVisible) {
             continue;
         }
         const auto classes = ReadString(element.Get(), &IUIAutomationElement::get_CachedClassName);
-        const auto name = ReadString(element.Get(), &IUIAutomationElement::get_CachedName);
+        std::wstring name;
         result.petFound |= HasClass(classes, L"pet-dock-content");
         result.popupVisible |= classes.find(L"chest-reward-popup") != classes.npos ||
             classes.find(L"chest-drop-motion") != classes.npos;
-        if (const auto number = CounterValue(name); number && (!result.total || *number > *result.total)) {
-            result.total = number;
+        if (readTotal) {
+            name = ReadString(element.Get(), &IUIAutomationElement::get_CachedName);
+            if (const auto number = CounterValue(name); number && (!result.total || *number > *result.total)) {
+                result.total = number;
+            }
         }
         const bool ready = HasClass(classes, L"reward-btn");
         const bool cooling = HasClass(classes, L"reward-countdown");
@@ -264,7 +275,10 @@ Reading Reader::ReadWindow(HWND window, bool requireVisible) {
         element->get_CachedIsEnabled(&enabled);
         const auto state = ready && enabled ? ChestState::Ready :
             cooling ? ChestState::Cooling : ChestState::Unavailable;
-        result.chests.push_back({state, bounds, cooling ? name : L"", std::move(element)});
+        if (cooling && !readTotal) {
+            name = ReadString(element.Get(), &IUIAutomationElement::get_CurrentName);
+        }
+        result.chests.push_back({state, bounds, cooling ? std::move(name) : std::wstring{}, std::move(element)});
     }
     std::ranges::stable_sort(result.chests, {}, [](const Chest& chest) { return chest.bounds.left; });
     return result;
