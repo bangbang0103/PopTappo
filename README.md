@@ -43,6 +43,8 @@ cmake --install build --config Release --prefix dist
 
 GitHub Actions 会在推送到 `main` 或提交指向 `main` 的 Pull Request 时构建 Windows x64 版本，也可手动运行 `Windows build`。构建成功后，在运行记录的 **Artifacts** 中下载 `PopTappo-Windows-x64`。
 
+推送形如 `v1.0.0` 的版本标签（或手动运行 `Release` 工作流并填写标签）会触发自动发布流程，按标签版本号构建 `PopTappo.exe` 与 `SHA256SUMS.txt` 并发布到 GitHub Releases。
+
 如需排查桌宠识别，可运行只读诊断。结果包括窗口、UI Automation、计数及宝箱状态。
 
 ```powershell
