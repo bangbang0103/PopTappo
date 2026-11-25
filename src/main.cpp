@@ -238,7 +238,10 @@ int App::Run(HINSTANCE instance) {
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.lpszClassName = WindowClass;
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    if (!windowClass.hIcon) {
+        windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
     if (!RegisterClassW(&windowClass)) {
         return 1;
     }
@@ -289,7 +292,12 @@ bool App::AddTray() {
     icon_.uID = 1;
     icon_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     icon_.uCallbackMessage = TrayEvent;
-    icon_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    icon_.hIcon = static_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+    if (!icon_.hIcon) {
+        icon_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
     wcscpy_s(icon_.szTip, AppName);
     if (!Shell_NotifyIconW(NIM_ADD, &icon_)) {
         return false;

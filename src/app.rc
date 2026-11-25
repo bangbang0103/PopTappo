@@ -4,6 +4,7 @@
 #include "version.h"
 
 1 RT_MANIFEST "app.manifest"
+IDI_APP_ICON ICON "app.ico"
 
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 1 VERSIONINFO
