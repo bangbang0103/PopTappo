@@ -33,7 +33,7 @@ STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMEN
 CAPTION "自定义连点速度"
 FONT 9, "Microsoft YaHei UI"
 BEGIN
-    LTEXT           "每秒连点次数（1–20）", -1, 12, 12, 152, 12
+    LTEXT           "每秒连点次数（1–100）", -1, 12, 12, 152, 12
     EDITTEXT        IDC_TAP_RATE, 12, 27, 70, 15, ES_NUMBER | ES_AUTOHSCROLL
     LTEXT           "", IDC_TAP_RATE_ERROR, 12, 47, 152, 12
     DEFPUSHBUTTON   "确定", IDOK, 60, 65, 48, 15

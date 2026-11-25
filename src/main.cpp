@@ -27,12 +27,12 @@ constexpr UINT SpeedMenuRow = 7;
 
 enum Command : UINT {
     ToggleTap = 100, ToggleChests, ToggleAwake, PauseAll, Refresh, Quit,
-    Speed5 = 120, Speed10, Speed20, CustomSpeed, Key24 = 130, Key23, Key22, Key21,
+    Speed10 = 120, Speed25, Speed100, CustomSpeed, Key24 = 130, Key23, Key22, Key21,
     SentStatus = 200, ChestStatus, TotalStatus
 };
 
-constexpr UINT PresetRates[] = {5, 10, 20};
-constexpr UINT MaxRate = 20;
+constexpr UINT PresetRates[] = {10, 25, 100};
+constexpr UINT MaxRate = 100;
 constexpr WORD Keys[] = {VK_F24, VK_F23, VK_F22, VK_F21};
 
 INT_PTR CALLBACK RateDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -57,7 +57,7 @@ INT_PTR CALLBACK RateDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         if (end != text && *end == L'\0' && rate >= 1 && rate <= MaxRate) {
             EndDialog(dialog, rate);
         } else {
-            SetDlgItemTextW(dialog, IDC_TAP_RATE_ERROR, L"请输入 1 到 20 的整数。");
+            SetDlgItemTextW(dialog, IDC_TAP_RATE_ERROR, L"请输入 1 到 100 的整数。");
             SetFocus(GetDlgItem(dialog, IDC_TAP_RATE));
             SendDlgItemMessageW(dialog, IDC_TAP_RATE, EM_SETSEL, 0, -1);
         }
@@ -112,7 +112,7 @@ void SyncRawInput(HWND window, USHORT usage, bool needed, bool& registered) {
 
 bool IsInlineCommand(UINT command) {
     return (command >= ToggleTap && command <= Refresh) ||
-        (command >= Speed5 && command <= CustomSpeed) ||
+        (command >= Speed10 && command <= CustomSpeed) ||
         (command >= Key24 && command <= Key21);
 }
 
@@ -498,7 +498,7 @@ void App::ShowMenu(POINT point) {
 
     for (UINT i = 0; i < ARRAYSIZE(PresetRates); ++i) {
         const auto label = std::to_wstring(PresetRates[i]) + L" 次/秒";
-        AppendMenuW(speed, MF_STRING, Speed5 + i, label.c_str());
+        AppendMenuW(speed, MF_STRING, Speed10 + i, label.c_str());
     }
     AppendMenuW(speed, MF_STRING, CustomSpeed, L"自定义…");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(speed), L"连点速度");
@@ -562,8 +562,8 @@ void App::ShowMenu(POINT point) {
 }
 
 void App::OnCommand(UINT command) {
-    if (command >= Speed5 && command <= Speed20) {
-        rate_ = PresetRates[command - Speed5];
+    if (command >= Speed10 && command <= Speed100) {
+        rate_ = PresetRates[command - Speed10];
     } else if (command >= Key24 && command <= Key21) {
         key_ = command - Key24;
     } else {
@@ -655,10 +655,10 @@ void App::UpdateMenuStatus() {
     UINT selectedSpeed = CustomSpeed;
     for (UINT i = 0; i < ARRAYSIZE(PresetRates); ++i) {
         if (rate_ == PresetRates[i]) {
-            selectedSpeed = Speed5 + i;
+            selectedSpeed = Speed10 + i;
         }
     }
-    const bool speedChanged = UpdateMenuRadio(speedMenu_, Speed5, CustomSpeed, selectedSpeed);
+    const bool speedChanged = UpdateMenuRadio(speedMenu_, Speed10, CustomSpeed, selectedSpeed);
     const bool keyChanged = UpdateMenuRadio(keyMenu_, Key24, Key21, Key24 + key_);
     const bool canPause = tap_ || open_;
     if (((GetMenuState(menu_, PauseAll, MF_BYCOMMAND) & MF_GRAYED) == 0) != canPause) {
