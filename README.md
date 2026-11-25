@@ -41,6 +41,8 @@ cmake --install build --config Release --prefix dist
 
 便携产物为 `dist\PopTappo.exe`。Release 使用静态 C++ 运行库，可以直接复制该 EXE。
 
+GitHub Actions 会在推送到 `main` 或提交指向 `main` 的 Pull Request 时构建 Windows x64 版本，也可手动运行 `Windows build`。构建成功后，在运行记录的 **Artifacts** 中下载 `PopTappo-Windows-x64`。
+
 如需排查桌宠识别，可运行只读诊断。结果包括窗口、UI Automation、计数及宝箱状态。
 
 ```powershell
