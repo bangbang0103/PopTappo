@@ -1,6 +1,14 @@
 # PopTappo
 
-用于 Windows 10 / 11 x64 的鸣潮桌宠托盘助手。使用 Win32 和 Windows UI Automation，提供单个便携 EXE。
+用于 Windows 10 / 11 x64 的鸣潮桌宠（Wuwa Tappo）轻量托盘助手。
+
+## 特性
+
+- **超小体积**：纯原生 Win32 C++20 + Windows UI Automation 开发，静态链接 C++ 运行库，单个便携 EXE（含内嵌多分辨率图标）仅约 **500 KB**，即下即用、无外部依赖。
+- **超低内存**：采用原生系统托盘菜单与事件/定时器驱动，无 WebView 或重型 UI 框架开销，后台挂机内存占用极低。
+- **不抢鼠标与键盘**：自动连点发送 `F21–F24` 功能键，不移动鼠标指针、不抢占窗口焦点；通过 Raw Input 与系统状态检测，在检测到键盘敲击、鼠标按键或系统菜单时自动避让。
+- **锁屏也可自动开箱**：通过 Windows UI Automation 直接读取并触发桌宠宝箱按钮，在 **Win+L 锁屏** 或 **息屏**（系统仍保持唤醒）状态下依然可继续自动开箱，并可配合「防自动睡眠」稳定挂机。
+- **原生托盘与版本更新**：菜单内实时展示发送次数、宝箱倒计时与桌宠读数，支持 10 / 25 / 100 次/秒预设及 1–100 自定义频率，底部提供版本展示与 GitHub Release 一键检查更新。
 
 ## 使用
 
@@ -50,5 +58,3 @@ GitHub Actions 会在推送到 `main` 或提交指向 `main` 的 Pull Request �
 ```powershell
 Start-Process .\PopTappo.exe -Wait -ArgumentList '--diagnose "C:\可写目录\tappo-status.txt"'
 ```
-
-实现思路参考 [WuwaTappoHelper](https://github.com/rnpfdl/WuwaTappoHelper) 和 [AutoTappo](https://github.com/To0Ru/AutoTappo)。
